@@ -62,6 +62,12 @@ async fn test() {
     let size = gw_sock.recv(&mut buffer).await.unwrap();
     assert_eq!(&[0x02, 0x01, 0x02, 0x01], &buffer[..size]);
 
+    // The socket to the server is opened (and registered with a PULL_DATA) before
+    // payload filters run, so that registration is all the server should see.
+    let size = server_sock.recv(&mut buffer).await.unwrap();
+    assert_eq!(12, size);
+    assert_eq!(0x02, buffer[3]);
+
     // Expect PUSH_DATA not to be forwarded.
     let resp = timeout(Duration::from_millis(100), server_sock.recv(&mut buffer)).await;
     assert!(resp.is_err());
