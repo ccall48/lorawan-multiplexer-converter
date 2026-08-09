@@ -244,8 +244,13 @@ impl PushDataPayload {
             .collect();
     }
 
+    /// Returns true when there is nothing worth forwarding.
+    ///
+    /// `stat` must be checked explicitly: it is a named field, so the flattened
+    /// `other` map never captures it. Omitting it here silently dropped every
+    /// stat-only PUSH_DATA on GWMP outputs.
     pub fn is_empty(&self) -> bool {
-        self.rxpk.is_empty() && self.other.is_empty()
+        self.rxpk.is_empty() && self.stat.is_none() && self.other.is_empty()
     }
 }
 
@@ -1290,5 +1295,41 @@ pub fn downlink_tx_ack_to_tx_ack(ack: &gw::DownlinkTxAck, gateway_id: &GatewayId
         random_token: token,
         gateway_id: *gateway_id.as_bytes(),
         payload,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_data(json: &str) -> PushData {
+        let mut b: Vec<u8> = vec![0x02, 0x01, 0x02, 0x00];
+        b.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        b.extend_from_slice(json.as_bytes());
+        PushData::from_slice(&b).unwrap()
+    }
+
+    #[test]
+    fn test_stat_only_push_data_is_not_empty() {
+        // A stat-only PUSH_DATA carries no rxpk, but must still be forwarded.
+        let pd = push_data(r#"{"stat":{"time":"2024-01-01 00:00:00 GMT","rxnb":1,"rxok":1,"ackr":100.0}}"#);
+        assert!(pd.payload.rxpk.is_empty());
+        assert!(pd.payload.stat.is_some());
+        assert!(!pd.payload.is_empty());
+    }
+
+    #[test]
+    fn test_truly_empty_push_data_is_empty() {
+        let pd = push_data(r#"{"rxpk":[]}"#);
+        assert!(pd.payload.is_empty());
+    }
+
+    #[test]
+    fn test_stat_survives_reserialization() {
+        let pd = push_data(r#"{"stat":{"rxnb":7,"txnb":3}}"#);
+        let round_tripped = PushData::from_slice(&pd.to_bytes()).unwrap();
+        let stat = round_tripped.payload.stat.expect("stat retained");
+        assert_eq!(stat.rxnb, Some(7));
+        assert_eq!(stat.txnb, Some(3));
     }
 }

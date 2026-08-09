@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use tokio::net::UdpSocket;
@@ -18,8 +18,15 @@ use crate::traits::PrintFullError;
 
 static GATEWAYS: OnceCell<RwLock<HashMap<GatewayId, Gateway>>> = OnceCell::const_new();
 
-/// Track pending downlink IDs by (gateway_id, token) -> downlink_id
-static PENDING_DOWNLINKS: OnceCell<RwLock<HashMap<(GatewayId, u16), u32>>> = OnceCell::const_new();
+/// Downlink IDs awaiting a TX_ACK, keyed by (gateway_id, token), with the time
+/// the entry was stored so unacknowledged downlinks can be expired.
+type PendingDownlinks = HashMap<(GatewayId, u16), (u32, Instant)>;
+
+static PENDING_DOWNLINKS: OnceCell<RwLock<PendingDownlinks>> = OnceCell::const_new();
+
+/// How long a downlink waits for its TX_ACK before the correlation entry is dropped.
+/// A gateway that never acks would otherwise leak an entry per downlink forever.
+const PENDING_DOWNLINK_TTL: Duration = Duration::from_secs(60);
 
 struct Gateway {
     addr: SocketAddr,
@@ -354,6 +361,8 @@ async fn cleanup_gateways() {
 
         trace!("Cleaning up inactive Gateway ID to addr mappings");
 
+        cleanup_pending_downlinks().await;
+
         let gateways = GATEWAYS
             .get_or_init(|| async { RwLock::new(HashMap::new()) })
             .await;
@@ -381,7 +390,26 @@ async fn store_pending_downlink(gateway_id: GatewayId, token: u16, downlink_id: 
         .get_or_init(|| async { RwLock::new(HashMap::new()) })
         .await;
     let mut pending = pending.write().await;
-    pending.insert((gateway_id, token), downlink_id);
+    pending.insert((gateway_id, token), (downlink_id, Instant::now()));
+}
+
+/// Drop downlink correlation entries that never received a TX_ACK.
+async fn cleanup_pending_downlinks() {
+    let pending = match PENDING_DOWNLINKS.get() {
+        Some(p) => p,
+        None => return,
+    };
+    let mut pending = pending.write().await;
+    let before = pending.len();
+    pending.retain(|_, (_, stored_at)| stored_at.elapsed() < PENDING_DOWNLINK_TTL);
+    let removed = before - pending.len();
+    if removed > 0 {
+        debug!(
+            removed = removed,
+            remaining = pending.len(),
+            "Cleaned up unacknowledged downlink correlations"
+        );
+    }
 }
 
 /// Get and remove a pending downlink ID.
@@ -390,7 +418,7 @@ async fn get_pending_downlink(gateway_id: GatewayId, token: u16) -> Option<u32> 
         .get_or_init(|| async { RwLock::new(HashMap::new()) })
         .await;
     let mut pending = pending.write().await;
-    let result = pending.remove(&(gateway_id, token));
+    let result = pending.remove(&(gateway_id, token)).map(|(id, _)| id);
     debug!(gateway_id = %gateway_id, token = token, downlink_id = ?result, "Retrieved pending downlink for TX_ACK");
     result
 }

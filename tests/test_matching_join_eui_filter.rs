@@ -60,6 +60,17 @@ async fn test() {
     let size = gw_sock.recv(&mut buffer).await.unwrap();
     assert_eq!(&[0x02, 0x01, 0x02, 0x01], &buffer[..size]);
 
+    // Expect the registration PULL_DATA the forwarder sends when it opens a new
+    // socket to a server, so the server knows where to route downlinks for this
+    // gateway. The random token varies, so only type and Gateway ID are checked.
+    let size = server_sock.recv(&mut buffer).await.unwrap();
+    assert_eq!(12, size);
+    assert_eq!(0x02, buffer[3]);
+    assert_eq!(
+        &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        &buffer[4..12]
+    );
+
     // Expect PUSH_DATA forwarded to server.
     let size = server_sock.recv(&mut buffer).await.unwrap();
     assert_eq!(

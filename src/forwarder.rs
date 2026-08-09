@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
@@ -17,6 +17,48 @@ use crate::packets::{GatewayId, PacketType, PullData, PushData, TxAck, get_rando
 use crate::traits::PrintFullError;
 
 static SERVERS: OnceCell<RwLock<Vec<Server>>> = OnceCell::const_new();
+
+/// Upper bound on PULL_RESP tokens tracked per (server, gateway) pair.
+const MAX_PENDING_PULL_RESP_TOKENS: usize = 16;
+
+/// Tokens of PULL_RESP packets received from a server and passed to the gateway,
+/// awaiting the matching TX_ACK.
+///
+/// This deliberately lives behind a plain `std::sync::Mutex` owned by the socket
+/// rather than inside the `SERVERS` `RwLock`: the critical section never awaits,
+/// so recording a downlink cannot block on the uplink loop, which holds the
+/// `SERVERS` write lock across every output's socket setup and send. Class A RX1
+/// is only 1s after the uplink, so that wait used to be enough to miss the window.
+#[derive(Default)]
+struct PullRespTokens(Mutex<VecDeque<u16>>);
+
+impl PullRespTokens {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<u16>> {
+        // The critical sections below cannot panic, so poisoning is unreachable;
+        // recover rather than propagate a panic into the downlink path.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn push(&self, token: u16) {
+        let mut tokens = self.lock();
+        if tokens.len() >= MAX_PENDING_PULL_RESP_TOKENS {
+            tokens.pop_front();
+        }
+        tokens.push_back(token);
+    }
+
+    /// Remove `token`, returning true when it was pending.
+    fn take(&self, token: u16) -> bool {
+        let mut tokens = self.lock();
+        match tokens.iter().position(|v| *v == token) {
+            Some(pos) => {
+                tokens.remove(pos);
+                true
+            }
+            None => false,
+        }
+    }
+}
 
 struct Server {
     server: String,
@@ -70,6 +112,7 @@ impl Server {
 
             let socket = Arc::new(socket);
             let (stop_tx, stop_rx) = oneshot::channel::<()>();
+            let pull_resp_tokens = Arc::new(PullRespTokens::default());
 
             tokio::spawn(handle_downlink(
                 self.server.clone(),
@@ -78,13 +121,43 @@ impl Server {
                 socket.clone(),
                 self.downlink_tx.clone(),
                 gateway_id,
+                pull_resp_tokens.clone(),
             ));
+
+            // Announce this source port to the server straight away. A server
+            // learns where to send PULL_RESP for a gateway only from PULL_DATA
+            // (chirpstack-gateway-bridge stores the address in its gateway
+            // registry on PULL_DATA alone). This socket is freshly bound to a
+            // new ephemeral port, so without this the server would keep aiming
+            // downlinks at the previous port until the gateway's next keepalive
+            // happened to pass through here — long enough to lose a join-accept.
+            // Uplink-only servers are skipped: their downlinks get dropped anyway.
+            let pull_data_token = if self.uplink_only {
+                None
+            } else {
+                let pull_data = PullData::new(&gateway_id);
+                match socket.send(&pull_data.to_bytes()).await {
+                    Ok(_) => {
+                        inc_server_udp_sent_count(&self.server, PacketType::PullData).await;
+                        Some(pull_data.random_token)
+                    }
+                    Err(e) => {
+                        warn!(
+                            gateway_id = %gateway_id,
+                            server = %self.server,
+                            error = %e,
+                            "Send initial PULL_DATA error"
+                        );
+                        None
+                    }
+                }
+            };
 
             e.insert(ServerSocket {
                 last_uplink: SystemTime::now(),
                 push_data_token: None,
-                pull_data_token: None,
-                pull_resp_token: None,
+                pull_data_token,
+                pull_resp_tokens,
                 _stop_tx: stop_tx,
                 socket,
             });
@@ -106,7 +179,7 @@ struct ServerSocket {
     socket: Arc<UdpSocket>,
     pull_data_token: Option<u16>,
     push_data_token: Option<u16>,
-    pull_resp_token: Option<u16>,
+    pull_resp_tokens: Arc<PullRespTokens>,
 }
 
 pub async fn setup(
@@ -258,189 +331,233 @@ async fn handle_uplink_packet(gateway_id: GatewayId, data: &[u8], region: &str, 
         .await;
     let mut servers = servers.write().await;
 
+    let ctx = UplinkContext {
+        packet_type,
+        random_token,
+        data,
+        parsed_push_data: parsed_push_data.as_ref(),
+        gateway_id,
+        relay_id,
+        dev_addr: &dev_addr_str,
+        f_port: &fport_str,
+    };
+
     for server in servers.iter_mut() {
-        // Determine effective gateway_id for this server (relay rewriting)
-        let (effective_gw, is_relay) = if let Some(rid) = relay_id {
-            if !server.relay_gateway_id_prefix.is_empty() {
-                let virtual_hex = format!("{}{}", server.relay_gateway_id_prefix, rid);
-                match GatewayId::from_hex(&virtual_hex) {
-                    Ok(virtual_gw) => {
-                        // Register mapping for downlink routing (with signal quality for best-gateway selection)
-                        let (rssi, snr) = parsed_push_data.as_ref()
-                            .and_then(|pd| pd.payload.rxpk.first())
-                            .map(|r| (r.rssi.unwrap_or(0), r.lsnr.unwrap_or(0.0) as f32))
-                            .unwrap_or((0, 0.0));
-                        mqtt::register_relay_gateway(virtual_gw, gateway_id, rssi, snr).await;
-                        // Register virtual gateway in MQTT_GATEWAYS for downlink routing back
-                        if let Some((srv, rgn, ctx)) = mqtt::get_mqtt_gateway_info(gateway_id).await {
-                            mqtt::register_mqtt_gateway_pub(virtual_gw, srv, rgn, ctx).await;
-                        }
-                        info!(
-                            server = %server.server,
-                            border_gateway = %gateway_id,
-                            virtual_gateway = %virtual_gw,
-                            relay_id = %rid,
-                            "Rewriting gateway_id for mesh relay (UDP output)"
-                        );
-                        (virtual_gw, true)
+        // Each output is independent. A server that is down, unresolvable, or
+        // returning ECONNREFUSED (which a connected UDP socket does after an
+        // ICMP port-unreachable) must not stop the outputs configured after it.
+        let server_name = server.server.clone();
+        if let Err(e) = forward_uplink_to_server(server, &ctx)
+            .instrument(tracing::info_span!("", server = %server_name))
+            .await
+        {
+            error!(server = %server_name, error = %e.full(), "Forward uplink to server error");
+        }
+    }
+
+    Ok(())
+}
+
+/// An uplink, parsed once, as handed to each output in turn.
+struct UplinkContext<'a> {
+    packet_type: PacketType,
+    random_token: u16,
+    data: &'a [u8],
+    parsed_push_data: Option<&'a PushData>,
+    gateway_id: GatewayId,
+    relay_id: Option<&'a str>,
+    dev_addr: &'a str,
+    f_port: &'a str,
+}
+
+async fn forward_uplink_to_server(server: &mut Server, ctx: &UplinkContext<'_>) -> Result<()> {
+    let UplinkContext {
+        packet_type,
+        random_token,
+        data,
+        parsed_push_data,
+        gateway_id,
+        relay_id,
+        dev_addr,
+        f_port,
+    } = *ctx;
+
+    // Determine effective gateway_id for this server (relay rewriting)
+    let (effective_gw, is_relay) = if let Some(rid) = relay_id {
+        if !server.relay_gateway_id_prefix.is_empty() {
+            let virtual_hex = format!("{}{}", server.relay_gateway_id_prefix, rid);
+            match GatewayId::from_hex(&virtual_hex) {
+                Ok(virtual_gw) => {
+                    // Register mapping for downlink routing (with signal quality for best-gateway selection)
+                    let (rssi, snr) = parsed_push_data
+                        .and_then(|pd| pd.payload.rxpk.first())
+                        .map(|r| (r.rssi.unwrap_or(0), r.lsnr.unwrap_or(0.0) as f32))
+                        .unwrap_or((0, 0.0));
+                    mqtt::register_relay_gateway(virtual_gw, gateway_id, rssi, snr).await;
+                    // Register virtual gateway in MQTT_GATEWAYS for downlink routing back
+                    if let Some((srv, rgn, gw_ctx)) = mqtt::get_mqtt_gateway_info(gateway_id).await {
+                        mqtt::register_mqtt_gateway_pub(virtual_gw, srv, rgn, gw_ctx).await;
                     }
-                    Err(e) => {
-                        warn!(relay_id = %rid, error = %e, "Invalid virtual gateway ID, using original");
-                        (gateway_id, false)
-                    }
+                    info!(
+                        server = %server.server,
+                        border_gateway = %gateway_id,
+                        virtual_gateway = %virtual_gw,
+                        relay_id = %rid,
+                        "Rewriting gateway_id for mesh relay (UDP output)"
+                    );
+                    (virtual_gw, true)
                 }
-            } else {
-                (gateway_id, false)
+                Err(e) => {
+                    warn!(relay_id = %rid, error = %e, "Invalid virtual gateway ID, using original");
+                    (gateway_id, false)
+                }
             }
         } else {
             (gateway_id, false)
-        };
-
-        if !server.match_gateway_id(effective_gw) {
-            continue;
         }
+    } else {
+        (gateway_id, false)
+    };
 
-        // Clone filters before mutable borrow of socket.
-        let filters = server.filters.clone();
-        let allow_deny_filters = server.allow_deny_filters.clone();
-        let server_name = server.server.clone();
+    if !server.match_gateway_id(effective_gw) {
+        return Ok(());
+    }
 
-        let socket = server.get_server_socket(effective_gw).await?;
-        socket.last_uplink = SystemTime::now();
+    // Clone filters before mutable borrow of socket.
+    let filters = server.filters.clone();
+    let allow_deny_filters = server.allow_deny_filters.clone();
+    let server_name = server.server.clone();
 
-        let span = tracing::info_span!("", addr = %socket.socket.peer_addr().unwrap());
-        let _enter = span.enter();
+    let socket = server.get_server_socket(effective_gw).await?;
+    socket.last_uplink = SystemTime::now();
 
-        // For relay virtual gateways, send PULL_DATA before the uplink so the
-        // LNS knows where to route downlinks for this virtual MAC.
-        if is_relay {
-            let pull_data = PullData::new(&effective_gw);
-            let pd_data = pull_data.to_bytes();
-            debug!(gateway_id = %effective_gw, "Sending PULL_DATA for virtual relay gateway");
-            socket.pull_data_token = Some(pull_data.random_token);
-            socket.socket.send(&pd_data).await.context("Send relay PULL_DATA")?;
-            inc_server_udp_sent_count(&server_name, PacketType::PullData).await;
-        }
+    // For relay virtual gateways, send PULL_DATA before the uplink so the
+    // LNS knows where to route downlinks for this virtual MAC.
+    if is_relay {
+        let pull_data = PullData::new(&effective_gw);
+        let pd_data = pull_data.to_bytes();
+        debug!(gateway_id = %effective_gw, "Sending PULL_DATA for virtual relay gateway");
+        socket.pull_data_token = Some(pull_data.random_token);
+        socket.socket.send(&pd_data).await.context("Send relay PULL_DATA")?;
+        inc_server_udp_sent_count(&server_name, PacketType::PullData).await;
+    }
 
-        match packet_type {
-            PacketType::PushData => {
-                if let Some(push_data) = &parsed_push_data {
-                    let has_payload_filters = !allow_deny_filters.dev_addr_deny.is_empty()
-                        || !allow_deny_filters.join_eui_deny.is_empty()
-                        || !allow_deny_filters.dev_addr_prefixes.is_empty()
-                        || !allow_deny_filters.join_eui_prefixes.is_empty()
-                        || !filters.dev_addr_prefixes.is_empty()
-                        || !filters.join_eui_prefixes.is_empty();
+    match packet_type {
+        PacketType::PushData => {
+            if let Some(push_data) = parsed_push_data {
+                let has_payload_filters = !allow_deny_filters.dev_addr_deny.is_empty()
+                    || !allow_deny_filters.join_eui_deny.is_empty()
+                    || !allow_deny_filters.dev_addr_prefixes.is_empty()
+                    || !allow_deny_filters.join_eui_prefixes.is_empty()
+                    || !filters.dev_addr_prefixes.is_empty()
+                    || !filters.join_eui_prefixes.is_empty();
 
-                    if push_data.payload.rxpk.is_empty() {
-                        // Stat-only packet (no rxpk) — forward raw bytes regardless of filters.
-                        if !push_data.payload.is_empty() {
-                            if is_relay {
-                                // Must re-serialize with virtual gateway_id
-                                let mut rewritten = push_data.clone();
-                                rewritten.gateway_id = *effective_gw.as_bytes();
-                                let rewritten_data = rewritten.to_bytes();
-                                info!(gateway_id = %effective_gw, "Forwarding UDP stats (relay)");
-                                socket.push_data_token = Some(random_token);
-                                socket.socket.send(&rewritten_data).await.context("Send UDP packet")?;
-                            } else {
-                                info!(gateway_id = %effective_gw, "Forwarding UDP stats");
-                                socket.push_data_token = Some(random_token);
-                                socket.socket.send(data).await.context("Send UDP packet")?;
-                            }
-                            inc_server_udp_sent_count(&server_name, packet_type).await;
+                if push_data.payload.rxpk.is_empty() {
+                    // Stat-only packet (no rxpk) — forward raw bytes regardless of filters.
+                    if !push_data.payload.is_empty() {
+                        if is_relay {
+                            // Must re-serialize with virtual gateway_id
+                            let mut rewritten = push_data.clone();
+                            rewritten.gateway_id = *effective_gw.as_bytes();
+                            let rewritten_data = rewritten.to_bytes();
+                            info!(gateway_id = %effective_gw, "Forwarding UDP stats (relay)");
+                            socket.push_data_token = Some(random_token);
+                            socket.socket.send(&rewritten_data).await.context("Send UDP packet")?;
                         } else {
-                            debug!("Nothing to send, UDP packet is empty");
+                            info!(gateway_id = %effective_gw, "Forwarding UDP stats");
+                            socket.push_data_token = Some(random_token);
+                            socket.socket.send(data).await.context("Send UDP packet")?;
                         }
-                    } else if !has_payload_filters && !is_relay {
-                        // No payload filters and no relay rewrite — raw passthrough.
-                        info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink");
+                        inc_server_udp_sent_count(&server_name, packet_type).await;
+                    } else {
+                        debug!("Nothing to send, UDP packet is empty");
+                    }
+                } else if !has_payload_filters && !is_relay {
+                    // No payload filters and no relay rewrite — raw passthrough.
+                    info!(gateway_id = %effective_gw, dev_addr = %dev_addr, f_port = %f_port, "Forwarding UDP uplink");
+                    socket.push_data_token = Some(random_token);
+                    socket.socket.send(data).await.context("Send UDP packet")?;
+                    inc_server_udp_sent_count(&server_name, packet_type).await;
+                } else {
+                    // Filters configured or relay rewrite needed — must process.
+                    let original_count = push_data.payload.rxpk.len();
+                    let mut filtered_push_data = push_data.clone();
+
+                    // Apply relay gateway_id rewrite and strip relay metadata
+                    if is_relay {
+                        filtered_push_data.gateway_id = *effective_gw.as_bytes();
+                        for rxpk in &mut filtered_push_data.payload.rxpk {
+                            if let Some(ref mut meta) = rxpk.meta {
+                                meta.remove("relay_id");
+                                meta.remove("hop_count");
+                                if meta.is_empty() {
+                                    rxpk.meta = None;
+                                }
+                            }
+                        }
+                        debug!(server = %server_name, "Stripped relay metadata from uplink");
+                    }
+
+                    if !allow_deny_filters.dev_addr_deny.is_empty()
+                        || !allow_deny_filters.join_eui_deny.is_empty()
+                    {
+                        filtered_push_data
+                            .payload
+                            .filter_rxpk_allow_deny(&allow_deny_filters);
+                    } else if !filters.dev_addr_prefixes.is_empty()
+                        || !filters.join_eui_prefixes.is_empty()
+                    {
+                        filtered_push_data
+                            .payload
+                            .filter_rxpk(&filters);
+                    }
+
+                    let remaining_count = filtered_push_data.payload.rxpk.len();
+
+                    if remaining_count == 0 {
+                        // All rxpk removed — drop.
+                        debug!("Nothing to send, UDP packet does not match filters");
+                    } else if remaining_count == original_count && !is_relay {
+                        // All rxpk passed and no relay — send original raw bytes.
+                        info!(gateway_id = %effective_gw, dev_addr = %dev_addr, f_port = %f_port, "Forwarding UDP uplink");
                         socket.push_data_token = Some(random_token);
                         socket.socket.send(data).await.context("Send UDP packet")?;
                         inc_server_udp_sent_count(&server_name, packet_type).await;
                     } else {
-                        // Filters configured or relay rewrite needed — must process.
-                        let original_count = push_data.payload.rxpk.len();
-                        let mut filtered_push_data = push_data.clone();
-
-                        // Apply relay gateway_id rewrite and strip relay metadata
-                        if is_relay {
-                            filtered_push_data.gateway_id = *effective_gw.as_bytes();
-                            for rxpk in &mut filtered_push_data.payload.rxpk {
-                                if let Some(ref mut meta) = rxpk.meta {
-                                    meta.remove("relay_id");
-                                    meta.remove("hop_count");
-                                    if meta.is_empty() {
-                                        rxpk.meta = None;
-                                    }
-                                }
-                            }
-                            debug!(server = %server_name, "Stripped relay metadata from uplink");
-                        }
-
-                        if !allow_deny_filters.dev_addr_deny.is_empty()
-                            || !allow_deny_filters.join_eui_deny.is_empty()
-                        {
-                            filtered_push_data
-                                .payload
-                                .filter_rxpk_allow_deny(&allow_deny_filters);
-                        } else if !filters.dev_addr_prefixes.is_empty()
-                            || !filters.join_eui_prefixes.is_empty()
-                        {
-                            filtered_push_data
-                                .payload
-                                .filter_rxpk(&filters);
-                        }
-
-                        let remaining_count = filtered_push_data.payload.rxpk.len();
-
-                        if remaining_count == 0 {
-                            // All rxpk removed — drop.
-                            debug!("Nothing to send, UDP packet does not match filters");
-                        } else if remaining_count == original_count && !is_relay {
-                            // All rxpk passed and no relay — send original raw bytes.
-                            info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink");
-                            socket.push_data_token = Some(random_token);
-                            socket.socket.send(data).await.context("Send UDP packet")?;
-                            inc_server_udp_sent_count(&server_name, packet_type).await;
-                        } else {
-                            // Re-serialize (filtered or relay-rewritten).
-                            let filtered_data = filtered_push_data.to_bytes();
-                            info!(gateway_id = %effective_gw, dev_addr = %dev_addr_str, f_port = %fport_str, "Forwarding UDP uplink (filtered)");
-                            socket.push_data_token = Some(random_token);
-                            socket.socket.send(&filtered_data).await.context("Send UDP packet")?;
-                            inc_server_udp_sent_count(&server_name, packet_type).await;
-                        }
+                        // Re-serialize (filtered or relay-rewritten).
+                        let filtered_data = filtered_push_data.to_bytes();
+                        info!(gateway_id = %effective_gw, dev_addr = %dev_addr, f_port = %f_port, "Forwarding UDP uplink (filtered)");
+                        socket.push_data_token = Some(random_token);
+                        socket.socket.send(&filtered_data).await.context("Send UDP packet")?;
+                        inc_server_udp_sent_count(&server_name, packet_type).await;
                     }
                 }
             }
-            PacketType::PullData => {
-                if is_relay {
-                    // Send PULL_DATA with virtual gateway_id
-                    let pull_data = PullData::new(&effective_gw);
-                    let pd_data = pull_data.to_bytes();
-                    info!(packet_type = %packet_type, gateway_id = %effective_gw, "Sending UDP packet (relay)");
-                    socket.pull_data_token = Some(pull_data.random_token);
-                    socket.socket.send(&pd_data).await.context("Send UDP packet")?;
-                } else {
-                    info!(packet_type = %packet_type, "Sending UDP packet");
-                    socket.pull_data_token = Some(random_token);
-                    socket.socket.send(data).await.context("Send UDP packet")?;
-                }
+        }
+        PacketType::PullData => {
+            if is_relay {
+                // Send PULL_DATA with virtual gateway_id
+                let pull_data = PullData::new(&effective_gw);
+                let pd_data = pull_data.to_bytes();
+                info!(packet_type = %packet_type, gateway_id = %effective_gw, "Sending UDP packet (relay)");
+                socket.pull_data_token = Some(pull_data.random_token);
+                socket.socket.send(&pd_data).await.context("Send UDP packet")?;
+            } else {
+                info!(packet_type = %packet_type, "Sending UDP packet");
+                socket.pull_data_token = Some(random_token);
+                socket.socket.send(data).await.context("Send UDP packet")?;
+            }
+            inc_server_udp_sent_count(&server_name, packet_type).await;
+        }
+        PacketType::TxAck => {
+            // Only ack back to the server that asked for this transmission.
+            if socket.pull_resp_tokens.take(random_token) {
+                info!(packet_type = %packet_type, "Sending UDP packet");
+                socket.socket.send(data).await.context("Send UDP packet")?;
                 inc_server_udp_sent_count(&server_name, packet_type).await;
             }
-            PacketType::TxAck => {
-                if let Some(pull_resp_token) = socket.pull_resp_token
-                    && pull_resp_token == random_token
-                {
-                    info!(packet_type = %packet_type, "Sending UDP packet");
-                    socket.pull_resp_token = None;
-                    socket.socket.send(data).await.context("Send UDP packet")?;
-                    inc_server_udp_sent_count(&server_name, packet_type).await;
-                }
-            }
-            _ => {}
         }
+        _ => {}
     }
 
     Ok(())
@@ -453,6 +570,7 @@ async fn handle_downlink(
     socket: Arc<UdpSocket>,
     downlink_tx: UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
     gateway_id: GatewayId,
+    pull_resp_tokens: Arc<PullRespTokens>,
 ) {
     let mut buffer: [u8; 65535] = [0; 65535];
 
@@ -485,6 +603,7 @@ async fn handle_downlink(
             &downlink_tx,
             gateway_id,
             &buffer[..size],
+            &pull_resp_tokens,
         )
         .instrument(tracing::info_span!("", addr = %addr, gateway_id = %gateway_id))
         .await
@@ -502,6 +621,7 @@ async fn handle_downlink_packet(
     downlink_tx: &UnboundedSender<(GatewayId, Vec<u8>, Option<u32>)>,
     gateway_id: GatewayId,
     data: &[u8],
+    pull_resp_tokens: &PullRespTokens,
 ) -> Result<()> {
     let packet_type = PacketType::try_from(data)?;
     let token = get_random_token(data)?;
@@ -515,7 +635,9 @@ async fn handle_downlink_packet(
             if uplink_only {
                 warn!("Dropping downlink, server is configured as uplink-only");
             } else {
-                set_pull_resp_token(server, gateway_id, token).await?;
+                // Records the token without touching the SERVERS lock, so the
+                // downlink reaches the gateway without waiting on the uplink loop.
+                pull_resp_tokens.push(token);
                 handle_pull_resp(downlink_tx, gateway_id, data).await?;
             }
         }
@@ -613,23 +735,6 @@ async fn cleanup_sockets() {
     }
 }
 
-async fn set_pull_resp_token(srv: &str, gateway_id: GatewayId, token: u16) -> Result<()> {
-    let servers = SERVERS
-        .get_or_init(|| async { RwLock::new(Vec::new()) })
-        .await;
-    let mut servers = servers.write().await;
-
-    for server in servers.iter_mut() {
-        if server.server.eq(srv)
-            && let Some(v) = server.sockets.get_mut(&gateway_id)
-        {
-            v.pull_resp_token = Some(token);
-        }
-    }
-
-    Ok(())
-}
-
 /// Send PULL_DATA to all UDP servers for an MQTT-in gateway.
 /// This registers the gateway with the servers so they can send downlinks.
 pub async fn send_pull_data_for_gateway(gateway_id: GatewayId) -> Result<()> {
@@ -673,31 +778,30 @@ pub async fn send_tx_ack_for_gateway(gateway_id: GatewayId, tx_ack: &TxAck) -> R
     let servers = SERVERS
         .get_or_init(|| async { RwLock::new(Vec::new()) })
         .await;
-    let mut servers = servers.write().await;
+    // Read lock is enough: the token store and the socket are both shared by
+    // reference, so this never blocks behind the uplink loop's write lock.
+    let servers = servers.read().await;
 
     let token = tx_ack.random_token;
     let data = tx_ack.to_bytes();
 
-    for server in servers.iter_mut() {
+    for server in servers.iter() {
         if !server.match_gateway_id(gateway_id) {
             continue;
         }
 
-        if let Some(socket) = server.sockets.get_mut(&gateway_id) {
+        if let Some(socket) = server.sockets.get(&gateway_id) {
             // Check if this server sent a PULL_RESP with a matching token
-            if let Some(pull_resp_token) = socket.pull_resp_token {
-                if pull_resp_token == token {
-                    info!(
-                        server = %server.server,
-                        gateway_id = %gateway_id,
-                        "Forwarding TX_ACK to UDP"
-                    );
+            if socket.pull_resp_tokens.take(token) {
+                info!(
+                    server = %server.server,
+                    gateway_id = %gateway_id,
+                    "Forwarding TX_ACK to UDP"
+                );
 
-                    socket.pull_resp_token = None;
-                    socket.socket.send(&data).await.context("Send TX_ACK")?;
-                    inc_server_udp_sent_count(&server.server, PacketType::TxAck).await;
-                    return Ok(());
-                }
+                socket.socket.send(&data).await.context("Send TX_ACK")?;
+                inc_server_udp_sent_count(&server.server, PacketType::TxAck).await;
+                return Ok(());
             }
         }
     }
