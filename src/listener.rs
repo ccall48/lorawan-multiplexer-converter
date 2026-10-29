@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
+use chirpstack_api::gw;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{OnceCell, RwLock};
@@ -13,7 +14,7 @@ use crate::basicstation;
 use crate::config;
 use crate::monitoring::{inc_gateway_udp_received_count, inc_gateway_udp_sent_count};
 use crate::mqtt;
-use crate::packets::{GatewayId, PacketType, PushData, TxAck, get_random_token};
+use crate::packets::{GatewayId, PacketType, PushData, TxAck, downlink_frame_item_to_pull_resp, get_random_token};
 use crate::traits::PrintFullError;
 
 static GATEWAYS: OnceCell<RwLock<HashMap<GatewayId, Gateway>>> = OnceCell::const_new();
@@ -27,6 +28,29 @@ static PENDING_DOWNLINKS: OnceCell<RwLock<PendingDownlinks>> = OnceCell::const_n
 /// How long a downlink waits for its TX_ACK before the correlation entry is dropped.
 /// A gateway that never acks would otherwise leak an entry per downlink forever.
 const PENDING_DOWNLINK_TTL: Duration = Duration::from_secs(60);
+
+/// A ChirpStack downlink frame with more than one item (e.g. RX1 and RX2),
+/// sent to a UDP gateway one item at a time. When the gateway rejects an item
+/// the next one is sent, as chirpstack-gateway-bridge does.
+struct PendingFrame {
+    frame: gw::DownlinkFrame,
+    index: usize,
+    statuses: Vec<gw::TxAckStatus>,
+    stored_at: Instant,
+}
+
+/// Multi-item downlink frames awaiting a TX_ACK, keyed by (gateway_id, downlink_id).
+static PENDING_FRAMES: OnceCell<RwLock<HashMap<(GatewayId, u32), PendingFrame>>> = OnceCell::const_new();
+
+/// What to do with a TX_ACK for a downlink that came from a ChirpStack frame.
+enum FrameAck {
+    /// Not a tracked multi-item frame; report the gateway's TX_ACK as-is.
+    Untracked,
+    /// The item was rejected; send this PULL_RESP for the next item instead of acking.
+    Retry(Vec<u8>),
+    /// An item was accepted or none are left; report a status for every item.
+    Done(Vec<gw::TxAckStatus>),
+}
 
 struct Gateway {
     addr: SocketAddr,
@@ -281,7 +305,24 @@ async fn handle_tx_ack(
                 let token = tx_ack.random_token;
                 // Look up the downlink_id from our pending map
                 let downlink_id = get_pending_downlink(gateway_id, token).await.unwrap_or(token as u32);
-                let ack = tx_ack.to_downlink_tx_ack(&gateway_id, downlink_id);
+                let ack = match advance_downlink_frame(gateway_id, downlink_id, tx_ack.status()).await {
+                    FrameAck::Untracked => tx_ack.to_downlink_tx_ack(&gateway_id, downlink_id),
+                    FrameAck::Retry(pull_resp) => {
+                        // ChirpStack only hears about the downlink once the last
+                        // attempt is acked, so the retry's own TX_ACK reports it.
+                        return handle_downlink_packet(gateway_id, &pull_resp, Some(downlink_id)).await;
+                    }
+                    FrameAck::Done(statuses) => gw::DownlinkTxAck {
+                        gateway_id: gateway_id.to_string(),
+                        downlink_id,
+                        items: statuses
+                            .into_iter()
+                            .map(|s| gw::DownlinkTxAckItem { status: s.into() })
+                            .collect(),
+                        downlink_id_legacy: Vec::new(),
+                        gateway_id_legacy: Vec::new(),
+                    },
+                };
 
                 info!(
                     gateway_id = %gateway_id,
@@ -409,8 +450,72 @@ async fn store_pending_downlink(gateway_id: GatewayId, token: u16, downlink_id: 
     pending.insert((gateway_id, token), (downlink_id, Instant::now()));
 }
 
+/// Keep a ChirpStack downlink frame so its later items (RX2) can be tried if the
+/// gateway rejects an earlier one. Single-item frames need no tracking.
+pub async fn store_downlink_frame(gateway_id: GatewayId, frame: &gw::DownlinkFrame) {
+    if frame.items.len() < 2 {
+        return;
+    }
+    let frames = PENDING_FRAMES
+        .get_or_init(|| async { RwLock::new(HashMap::new()) })
+        .await;
+    let mut frames = frames.write().await;
+    frames.insert(
+        (gateway_id, frame.downlink_id),
+        PendingFrame {
+            frame: frame.clone(),
+            index: 0,
+            statuses: vec![gw::TxAckStatus::Ignored; frame.items.len()],
+            stored_at: Instant::now(),
+        },
+    );
+}
+
+/// Record the gateway's status for the frame's current item and decide whether
+/// to try the next item or report the result.
+async fn advance_downlink_frame(gateway_id: GatewayId, downlink_id: u32, status: gw::TxAckStatus) -> FrameAck {
+    let frames = match PENDING_FRAMES.get() {
+        Some(f) => f,
+        None => return FrameAck::Untracked,
+    };
+    let mut frames = frames.write().await;
+    let key = (gateway_id, downlink_id);
+    let pending = match frames.get_mut(&key) {
+        Some(p) => p,
+        None => return FrameAck::Untracked,
+    };
+
+    pending.statuses[pending.index] = status;
+
+    while status != gw::TxAckStatus::Ok && pending.index + 1 < pending.frame.items.len() {
+        pending.index += 1;
+        match downlink_frame_item_to_pull_resp(&pending.frame, pending.index) {
+            Ok(pull_resp) => {
+                info!(
+                    gateway_id = %gateway_id,
+                    downlink_id = downlink_id,
+                    status = ?status,
+                    item_index = pending.index,
+                    "Downlink item rejected, trying next item"
+                );
+                return FrameAck::Retry(pull_resp);
+            }
+            Err(e) => {
+                warn!(gateway_id = %gateway_id, downlink_id = downlink_id, item_index = pending.index, error = %e, "Skipping unconvertible downlink item");
+                pending.statuses[pending.index] = gw::TxAckStatus::InternalError;
+            }
+        }
+    }
+
+    frames.remove(&key).map(|p| FrameAck::Done(p.statuses)).unwrap_or(FrameAck::Untracked)
+}
+
 /// Drop downlink correlation entries that never received a TX_ACK.
 async fn cleanup_pending_downlinks() {
+    if let Some(frames) = PENDING_FRAMES.get() {
+        frames.write().await.retain(|_, p| p.stored_at.elapsed() < PENDING_DOWNLINK_TTL);
+    }
+
     let pending = match PENDING_DOWNLINKS.get() {
         Some(p) => p,
         None => return,
@@ -437,4 +542,91 @@ async fn get_pending_downlink(gateway_id: GatewayId, token: u16) -> Option<u32> 
     let result = pending.remove(&(gateway_id, token)).map(|(id, _)| id);
     debug!(gateway_id = %gateway_id, token = token, downlink_id = ?result, "Retrieved pending downlink for TX_ACK");
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RX1 at 926.9 MHz +5s, RX2 at 923.3 MHz +6s, as ChirpStack sends a join-accept.
+    fn join_accept_frame(downlink_id: u32) -> gw::DownlinkFrame {
+        let item = |frequency: u32, seconds: i64| gw::DownlinkFrameItem {
+            phy_payload: vec![0x20, 0x01],
+            tx_info: Some(gw::DownlinkTxInfo {
+                frequency,
+                power: 27,
+                timing: Some(gw::Timing {
+                    parameters: Some(gw::timing::Parameters::Delay(gw::DelayTimingInfo {
+                        delay: Some(chirpstack_api::pbjson_types::Duration { seconds, nanos: 0 }),
+                    })),
+                }),
+                context: 1_000_000u32.to_be_bytes().to_vec(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        gw::DownlinkFrame {
+            downlink_id,
+            items: vec![item(926_900_000, 5), item(923_300_000, 6)],
+            ..Default::default()
+        }
+    }
+
+    fn txpk(pull_resp: &[u8]) -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(&pull_resp[4..]).unwrap()["txpk"].clone()
+    }
+
+    #[tokio::test]
+    async fn test_rejected_rx1_retries_rx2() {
+        let gateway_id = GatewayId::from_hex("0000000000000001").unwrap();
+        store_downlink_frame(gateway_id, &join_accept_frame(10)).await;
+
+        let pull_resp = match advance_downlink_frame(gateway_id, 10, gw::TxAckStatus::TooEarly).await {
+            FrameAck::Retry(b) => b,
+            _ => panic!("expected RX2 retry"),
+        };
+        let txpk = txpk(&pull_resp);
+        assert_eq!(txpk["freq"], serde_json::json!(923.3));
+        assert_eq!(txpk["tmst"], serde_json::json!(7_000_000u32));
+
+        match advance_downlink_frame(gateway_id, 10, gw::TxAckStatus::Ok).await {
+            FrameAck::Done(s) => assert_eq!(s, vec![gw::TxAckStatus::TooEarly, gw::TxAckStatus::Ok]),
+            _ => panic!("expected done"),
+        }
+        // The frame is forgotten once acked.
+        assert!(matches!(advance_downlink_frame(gateway_id, 10, gw::TxAckStatus::Ok).await, FrameAck::Untracked));
+    }
+
+    #[tokio::test]
+    async fn test_accepted_rx1_ignores_rx2() {
+        let gateway_id = GatewayId::from_hex("0000000000000002").unwrap();
+        store_downlink_frame(gateway_id, &join_accept_frame(20)).await;
+
+        match advance_downlink_frame(gateway_id, 20, gw::TxAckStatus::Ok).await {
+            FrameAck::Done(s) => assert_eq!(s, vec![gw::TxAckStatus::Ok, gw::TxAckStatus::Ignored]),
+            _ => panic!("expected done"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_all_items_rejected() {
+        let gateway_id = GatewayId::from_hex("0000000000000003").unwrap();
+        store_downlink_frame(gateway_id, &join_accept_frame(30)).await;
+
+        assert!(matches!(advance_downlink_frame(gateway_id, 30, gw::TxAckStatus::TooEarly).await, FrameAck::Retry(_)));
+        match advance_downlink_frame(gateway_id, 30, gw::TxAckStatus::TooLate).await {
+            FrameAck::Done(s) => assert_eq!(s, vec![gw::TxAckStatus::TooEarly, gw::TxAckStatus::TooLate]),
+            _ => panic!("expected done"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_item_frame_untracked() {
+        let gateway_id = GatewayId::from_hex("0000000000000004").unwrap();
+        let mut frame = join_accept_frame(40);
+        frame.items.truncate(1);
+        store_downlink_frame(gateway_id, &frame).await;
+
+        assert!(matches!(advance_downlink_frame(gateway_id, 40, gw::TxAckStatus::TooEarly).await, FrameAck::Untracked));
+    }
 }

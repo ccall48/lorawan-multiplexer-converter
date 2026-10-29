@@ -630,6 +630,9 @@ async fn handle_downlink_message(
         // Convert to PULL_RESP for UDP gateways
         let pull_resp = downlink_frame_to_pull_resp(&frame, &gateway_id)?;
 
+        // Keep the frame so RX2 can be tried if the gateway rejects RX1
+        crate::listener::store_downlink_frame(gateway_id, &frame).await;
+
         // Send to downlink channel with the real downlink_id for TX_ACK correlation
         downlink_tx
             .send((gateway_id, pull_resp, Some(frame.downlink_id)))

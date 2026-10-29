@@ -813,8 +813,14 @@ impl RxPk {
 
 /// Convert a ChirpStack DownlinkFrame to Semtech PULL_RESP bytes.
 pub fn downlink_frame_to_pull_resp(frame: &gw::DownlinkFrame, _gateway_id: &GatewayId) -> Result<Vec<u8>> {
-    // Get the first item from the downlink frame
-    let item = frame.items.first().ok_or_else(|| anyhow!("No items in downlink frame"))?;
+    downlink_frame_item_to_pull_resp(frame, 0)
+}
+
+/// Convert one item of a ChirpStack DownlinkFrame (e.g. 0 = RX1, 1 = RX2) to
+/// Semtech PULL_RESP bytes. Every item shares the frame's token, so its TX_ACK
+/// correlates to the same downlink.
+pub fn downlink_frame_item_to_pull_resp(frame: &gw::DownlinkFrame, index: usize) -> Result<Vec<u8>> {
+    let item = frame.items.get(index).ok_or_else(|| anyhow!("No item {} in downlink frame", index))?;
     let tx_info = item.tx_info.as_ref().ok_or_else(|| anyhow!("No tx_info in downlink item"))?;
 
     let txpk = build_txpk(item, tx_info)?;
@@ -1204,7 +1210,20 @@ impl TxAck {
 
     /// Convert to ChirpStack DownlinkTxAck
     pub fn to_downlink_tx_ack(&self, gateway_id: &GatewayId, downlink_id: u32) -> gw::DownlinkTxAck {
-        let status = match &self.payload {
+        gw::DownlinkTxAck {
+            gateway_id: gateway_id.to_string(),
+            downlink_id,
+            items: vec![gw::DownlinkTxAckItem {
+                status: self.status().into(),
+            }],
+            downlink_id_legacy: Vec::new(),
+            gateway_id_legacy: Vec::new(),
+        }
+    }
+
+    /// The gateway's result for the transmitted txpk, as a ChirpStack status.
+    pub fn status(&self) -> gw::TxAckStatus {
+        match &self.payload {
             Some(p) => match p.txpk_ack.error.as_deref() {
                 None | Some("") | Some("NONE") | Some("OK") => gw::TxAckStatus::Ok,
                 Some("TOO_LATE") => gw::TxAckStatus::TooLate,
@@ -1217,16 +1236,6 @@ impl TxAck {
                 _ => gw::TxAckStatus::InternalError,
             },
             None => gw::TxAckStatus::Ok,
-        };
-
-        gw::DownlinkTxAck {
-            gateway_id: gateway_id.to_string(),
-            downlink_id,
-            items: vec![gw::DownlinkTxAckItem {
-                status: status.into(),
-            }],
-            downlink_id_legacy: Vec::new(),
-            gateway_id_legacy: Vec::new(),
         }
     }
 
