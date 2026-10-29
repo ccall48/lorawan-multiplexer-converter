@@ -835,6 +835,11 @@ pub fn downlink_frame_to_pull_resp(frame: &gw::DownlinkFrame, _gateway_id: &Gate
 fn build_txpk(item: &gw::DownlinkFrameItem, tx_info: &gw::DownlinkTxInfo) -> Result<serde_json::Value> {
     let mut txpk = serde_json::Map::new();
 
+    // Always present, as chirpstack-gateway-bridge sends it. The Semtech spec
+    // marks it optional, but gwmp-mux (semtech-udp) rejects a txpk without it,
+    // dropping every timed downlink to gateways behind it.
+    txpk.insert("imme".into(), serde_json::json!(false));
+
     // Immediate or timestamped - use the Timing struct's parameters field
     if let Some(timing) = &tx_info.timing {
         match &timing.parameters {
@@ -1322,6 +1327,47 @@ mod tests {
     fn test_truly_empty_push_data_is_empty() {
         let pd = push_data(r#"{"rxpk":[]}"#);
         assert!(pd.payload.is_empty());
+    }
+
+    fn downlink_frame(timing: gw::timing::Parameters) -> gw::DownlinkFrame {
+        gw::DownlinkFrame {
+            downlink_id: 1,
+            items: vec![gw::DownlinkFrameItem {
+                phy_payload: vec![0x20, 0x01],
+                tx_info: Some(gw::DownlinkTxInfo {
+                    frequency: 926_900_000,
+                    power: 30,
+                    timing: Some(gw::Timing { parameters: Some(timing) }),
+                    context: 2_993_303_688u32.to_be_bytes().to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn txpk_json(frame: &gw::DownlinkFrame) -> serde_json::Value {
+        let gateway_id = GatewayId::from_hex("0c8629fffee08fad").unwrap();
+        let b = downlink_frame_to_pull_resp(frame, &gateway_id).unwrap();
+        serde_json::from_slice::<serde_json::Value>(&b[4..]).unwrap()["txpk"].clone()
+    }
+
+    #[test]
+    fn test_delayed_pull_resp_has_imme_false() {
+        // Join-accept: RX1 5s after the join-request.
+        let frame = downlink_frame(gw::timing::Parameters::Delay(gw::DelayTimingInfo {
+            delay: Some(pbjson_types::Duration { seconds: 5, nanos: 0 }),
+        }));
+        let txpk = txpk_json(&frame);
+        assert_eq!(txpk["imme"], serde_json::json!(false));
+        assert_eq!(txpk["tmst"], serde_json::json!(2_998_303_688u32));
+    }
+
+    #[test]
+    fn test_immediate_pull_resp_has_imme_true() {
+        let frame = downlink_frame(gw::timing::Parameters::Immediately(gw::ImmediatelyTimingInfo {}));
+        assert_eq!(txpk_json(&frame)["imme"], serde_json::json!(true));
     }
 
     #[test]
