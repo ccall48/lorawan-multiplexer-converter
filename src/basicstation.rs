@@ -1205,8 +1205,7 @@ fn pull_resp_to_dnmsg(pull_resp: &PullResp, info: &BsGatewayInfo) -> Result<Down
     // PDU as hex string.
     let pdu = hex::encode(&txpk.data);
 
-    // RxDelay: extract from timing. For delayed transmissions, the delay in seconds.
-    let rx_delay = 1u8; // Default RX1 delay
+    let (rx_delay, xtime) = class_a_timing(txpk.tmst, info.last_xtime);
 
     Ok(DownlinkMessage {
         msgtype: "dnmsg".into(),
@@ -1219,13 +1218,38 @@ fn pull_resp_to_dnmsg(pull_resp: &PullResp, info: &BsGatewayInfo) -> Result<Down
         rx1freq: freq_hz,
         rx2dr: dr, // Simplified: same DR for RX2
         rx2freq: freq_hz,
-        xtime: info.last_xtime,
+        xtime,
         rctx: info.last_rctx,
         priority: 0,
         dr: None,
         freq: None,
         gpstime: None,
     })
+}
+
+/// Derive the dnmsg RxDelay and xtime that make the station transmit at the
+/// PULL_RESP's target `tmst`.
+///
+/// Basic Station schedules a class A downlink at `xtime + RxDelay` seconds, so
+/// the delay must come from the target tmst. A fixed RxDelay of 1 sent every
+/// join-accept (RX1 at 5s) four seconds early, while the device was not
+/// listening. `last_xtime` is the most recent uplink from the gateway, which
+/// is not necessarily the one being answered, so xtime is shifted by the
+/// sub-second remainder to land exactly on the target.
+fn class_a_timing(tmst: Option<u32>, last_xtime: u64) -> (u8, u64) {
+    let Some(tmst) = tmst else {
+        return (1, last_xtime);
+    };
+    if last_xtime == 0 {
+        return (1, last_xtime);
+    }
+
+    // tmst is the low 32 bits of xtime (see updf_to_push_data).
+    let delay_us = tmst.wrapping_sub(last_xtime as u32) as i64;
+    let rx_delay = ((delay_us + 500_000) / 1_000_000).clamp(1, 15);
+    let xtime = (last_xtime as i64 + delay_us - rx_delay * 1_000_000) as u64;
+
+    (rx_delay as u8, xtime)
 }
 
 // ----- Output (WS Client) -----
@@ -1946,9 +1970,16 @@ fn dnmsg_to_pull_resp(dnmsg: &DownlinkMessage, dr_table: &[[i32; 3]]) -> Result<
         None => (serde_json::json!("SF7BW125"), "LORA", Some("4/5")),
     };
 
+    // dnmsg carries the xtime of the uplink being answered; the station adds
+    // RxDelay itself (0 means 1s, as in LoRaWAN). A GWMP tmst is the absolute
+    // transmit time, so the delay must be added here or the packet forwarder
+    // rejects it as too late.
+    let rx_delay_us = dnmsg.rx_delay.max(1) as u64 * 1_000_000;
+    let tmst = (dnmsg.xtime.wrapping_add(rx_delay_us) & 0xFFFFFFFF) as u32;
+
     let mut txpk = serde_json::Map::new();
     txpk.insert("imme".into(), serde_json::json!(false));
-    txpk.insert("tmst".into(), serde_json::json!((dnmsg.xtime & 0xFFFFFFFF) as u32));
+    txpk.insert("tmst".into(), serde_json::json!(tmst));
     txpk.insert("freq".into(), serde_json::json!(freq_mhz));
     txpk.insert("rfch".into(), serde_json::json!(0));
     txpk.insert("powe".into(), serde_json::json!(14));
@@ -1988,4 +2019,74 @@ fn gps_time_now() -> u64 {
     // GPS time doesn't include leap seconds, but for simplicity we use Unix time offset.
     // Current leap seconds offset (as of 2024): 18 seconds
     unix_secs.saturating_sub(GPS_EPOCH_OFFSET) + 18
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dnmsg(xtime: u64, rx_delay: u8) -> DownlinkMessage {
+        DownlinkMessage {
+            msgtype: "dnmsg".into(),
+            dev_eui: String::new(),
+            dc: 0,
+            diid: 1,
+            pdu: "20".into(),
+            rx_delay,
+            rx1dr: 0,
+            rx1freq: 868_100_000,
+            rx2dr: 0,
+            rx2freq: 869_525_000,
+            xtime,
+            rctx: 0,
+            priority: 0,
+            dr: None,
+            freq: None,
+            gpstime: None,
+        }
+    }
+
+    fn txpk_tmst(pull_resp: &[u8]) -> u32 {
+        PullResp::from_slice(pull_resp).unwrap().txpk.tmst.unwrap()
+    }
+
+    #[test]
+    fn test_class_a_timing_join_accept() {
+        // Join-accept for the uplink at last_xtime, RX1 at 5s.
+        let last_xtime = 0x0001_0000_1000_0000;
+        let tmst = (last_xtime as u32).wrapping_add(5_000_000);
+        assert_eq!(class_a_timing(Some(tmst), last_xtime), (5, last_xtime));
+    }
+
+    #[test]
+    fn test_class_a_timing_later_uplink() {
+        // Another uplink arrived 1.3s after the join-request being answered.
+        let join_xtime: u64 = 0x0001_0000_1000_0000;
+        let last_xtime = join_xtime + 1_300_000;
+        let tmst = (join_xtime as u32).wrapping_add(5_000_000);
+        let (rx_delay, xtime) = class_a_timing(Some(tmst), last_xtime);
+        assert_eq!(rx_delay, 4);
+        assert_eq!(xtime + rx_delay as u64 * 1_000_000, join_xtime + 5_000_000);
+    }
+
+    #[test]
+    fn test_class_a_timing_tmst_wrap() {
+        let last_xtime: u64 = 0x0001_0000_FFFF_FF00;
+        let tmst = (last_xtime as u32).wrapping_add(1_000_000);
+        assert_eq!(class_a_timing(Some(tmst), last_xtime), (1, last_xtime));
+    }
+
+    #[test]
+    fn test_dnmsg_to_pull_resp_adds_rx_delay() {
+        let xtime = 0x0001_0000_1000_0000;
+        let pull_resp = dnmsg_to_pull_resp(&dnmsg(xtime, 5), &[]).unwrap();
+        assert_eq!(txpk_tmst(&pull_resp), (xtime as u32).wrapping_add(5_000_000));
+    }
+
+    #[test]
+    fn test_dnmsg_to_pull_resp_rx_delay_zero_is_one_second() {
+        let xtime = 0x0001_0000_1000_0000;
+        let pull_resp = dnmsg_to_pull_resp(&dnmsg(xtime, 0), &[]).unwrap();
+        assert_eq!(txpk_tmst(&pull_resp), (xtime as u32).wrapping_add(1_000_000));
+    }
 }
