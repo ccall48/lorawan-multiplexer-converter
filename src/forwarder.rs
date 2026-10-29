@@ -650,7 +650,11 @@ async fn handle_downlink(
                 match v  {
                     Ok(v) => v,
                     Err(e) => {
-                        error!(error = %e, "UDP socket receive error");
+                        // E.g. ICMP port unreachable while the server restarts.
+                        // Remove the socket so that the next uplink creates a
+                        // new one, else downlinks stop until restart.
+                        error!(error = %e, server = %server, gateway_id = %gateway_id, "UDP socket receive error, removing socket");
+                        remove_server_socket(&server, gateway_id, &socket).await;
                         break;
                     },
                 },
@@ -805,6 +809,26 @@ async fn cleanup_sockets() {
     }
 }
 
+async fn remove_server_socket(srv: &str, gateway_id: GatewayId, socket: &Arc<UdpSocket>) {
+    let servers = SERVERS
+        .get_or_init(|| async { RwLock::new(Vec::new()) })
+        .await;
+    let mut servers = servers.write().await;
+
+    for server in servers.iter_mut() {
+        // Only remove if it is still the same socket, it might already have
+        // been replaced.
+        if server.server.eq(srv)
+            && server
+                .sockets
+                .get(&gateway_id)
+                .is_some_and(|v| Arc::ptr_eq(&v.socket, socket))
+        {
+            server.sockets.remove(&gateway_id);
+        }
+    }
+}
+
 /// Send PULL_DATA to all UDP servers for an MQTT-in gateway.
 /// This registers the gateway with the servers so they can send downlinks.
 pub async fn send_pull_data_for_gateway(gateway_id: GatewayId) -> Result<()> {
@@ -841,8 +865,16 @@ pub async fn send_pull_data_for_gateway(gateway_id: GatewayId) -> Result<()> {
         );
 
         socket.pull_data_token = Some(token);
-        socket.socket.send(&data).await.context("Send PULL_DATA")?;
-        inc_server_udp_sent_count(&server_name, PacketType::PullData).await;
+        // Don't return on error, else the remaining servers are skipped.
+        match socket.socket.send(&data).await {
+            Ok(_) => inc_server_udp_sent_count(&server_name, PacketType::PullData).await,
+            Err(e) => error!(
+                server = %server_name,
+                gateway_id = %gateway_id,
+                error = %e,
+                "Failed to send PULL_DATA"
+            ),
+        }
     }
 
     Ok(())
